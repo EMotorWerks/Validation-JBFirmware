@@ -15,8 +15,8 @@ from azure.cosmosdb.table.tableservice import TableService
 SERIAL_PORT = '/dev/ttyUSB0'
 SERIAL_SPEED = 9600
 ENERGY_REQ = b'\xC0\x48\xFF\xFF\xFD\x00\x00\x00\x00\x00\xD2\x01\x30\x00\x01\x1C\xC0'
-STORE_FOLDER = '/home/pi/jb_test_rig/'
-#STORE_FOLDER = '/Users/stepanmoiseev/Code/jb_test_rig/'
+STORE_FOLDER = ''
+
 
 STORE_FILE_ALL = STORE_FOLDER + 'all.pickle'
 
@@ -29,7 +29,7 @@ ACCOUNT_TOKEN = ''
 TOKEN = ''
 DEVICE_ID = ''
 API_HISTORY_REQUEST = {'cmd':'get_history','device_id': DEVICE_ID,'token': TOKEN,'account_token': ACCOUNT_TOKEN}
-
+TABLE = ''
 
 #Data storage - list constsing of:
 #timestamp (seconds from epoch, also used for sorting by time)
@@ -57,7 +57,7 @@ def init():
 
 def tcp_data():
     table_service = TableService(connection_string=CONNECTION_STRING)
-    requests = list(table_service.query_entities('XCelApiCalls', filter="Url eq '"+UNIT_URL+"'", select='Request'))
+    requests = list(table_service.query_entities(TABLE, filter="Url eq '"+UNIT_URL+"'", select='Request'))
     eventlogs = []
     for request in requests:
         if 'eventlog' in json.loads(request['Request']):
