@@ -29,7 +29,8 @@ ACCOUNT_TOKEN = ''
 TOKEN = ''
 DEVICE_ID = ''
 API_HISTORY_REQUEST = {'cmd':'get_history','device_id': DEVICE_ID,'token': TOKEN,'account_token': ACCOUNT_TOKEN}
-TABLE = ''
+TCP_TABLE = ''
+UDP_TABLE = ''
 
 #Data storage - list constsing of:
 #timestamp (seconds from epoch, also used for sorting by time)
@@ -57,7 +58,7 @@ def init():
 
 def tcp_data():
     table_service = TableService(connection_string=CONNECTION_STRING)
-    requests = list(table_service.query_entities(TABLE, filter="Url eq '"+UNIT_URL+"'", select='Request'))
+    requests = list(table_service.query_entities(TCP_TABLE, filter="Url eq '"+UNIT_URL+"'", select='Request'))
     eventlogs = []
     for request in requests:
         if 'eventlog' in json.loads(request['Request']):
@@ -70,7 +71,6 @@ def tcp_data():
             event_datetime = pytz.utc.localize(event_datetime)
             messages = eventlog[event_day_key][event_time_key]
             #messages should be in time order
-            #tbd - check if we have a start session
             for message in messages:
                 if message['code'] == '066': #start session
                     time_start = event_datetime
@@ -87,48 +87,132 @@ def tcp_data():
                     tcp_sessions.append(tcp_session)
     return tcp_sessions
 
+def tcp_ecache():
+    table_service = TableService(connection_string=CONNECTION_STRING)
+    requests = list(table_service.query_entities(TCP_TABLE, filter="Url eq '"+UNIT_URL+"'", select='Request'))
+    eventlogs = []
+    ecaches = []
+    for request in requests:
+        if 'ecache' in json.loads(request['Request']):
+            ecaches.append(json.loads(request['Request'])['ecache'])
+    tcp_ecache = []
+    for ecache in ecaches:
+        #assuming 15-min intervals
+        ecache_day_key = list(ecache['intervals'].keys())[0]
+        ecache_day = ecache['intervals'][ecache_day_key]
+        #print(ecache_day_key, ecache_day)
+        for i in range(0, len(ecache_day)):
+            if ecache_day[i] > 0:
+                ecache_datetime_start = datetime.strptime(ecache_day_key, '%Y-%m-%dZ').replace(hour=i*15//60, minute=i*15%60, second=0)
+                ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
+                timestamp = datetime.timestamp(ecache_datetime_start)
+                tcp_ecache.append([timestamp, ecache_datetime_start, ecache_datetime_end, 'TCP', ecache_day[i]])
+    tcp_ecache.sort()
+    return list(tcp_ecache for tcp_ecache,_ in itertools.groupby(tcp_ecache)) #removed duplicates
+
+def udp_ecache(timestamp):
+    table_service = TableService(connection_string=CONNECTION_STRING)
+    udp_requests = list(table_service.query_entities(UDP_TABLE, filter="Timestamp gt datetime'"+timestamp+"' and PartitionKey eq '"+DEVICE_ID+"'", select='Request'))
+    udp_list = []
+    for udp_request in udp_requests:
+        etag = datetime.strptime(udp_request['etag'][:35], 'W/"datetime\'%Y-%m-%dT%H%%3A%M%%3A%S')
+        request = udp_request['Request'].split(',')
+        if len(request) >=12:
+            e = request[11]
+            if request[11][0] == 'e':
+                e = request[11][1:]
+                if int(e) > 0:
+                    i = int(request[10][1:])
+                    ecache_datetime_start = etag.replace(hour=i*15//60, minute=i*15%60, second=0)
+                    if ecache_datetime_start > etag: # if it shows previous day
+                        ecache_datetime_start = ecache_datetime_start - timedelta(days=1)
+                    ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
+                    timestamp = datetime.timestamp(ecache_datetime_start)
+                    udp_list.append([timestamp, ecache_datetime_start, ecache_datetime_end, 'UDP', e])
+    return udp_list
+
 
 def energy_session(duration):
     port = serial.Serial(SERIAL_PORT, SERIAL_SPEED)
     port.timeout = 1
     os.system('echo "1" > /sys/class/gpio/gpio15/value')
     os.system('echo "1" > /sys/class/gpio/gpio18/value')
-    timestamp = int(time.time())
-    datetime_start = datetime.now(pytz.utc)
+    session_timestamp = int(time.time())
+    session_datetime_start = datetime.now(pytz.utc)
+    datetime_start = session_datetime_start
+    datetime_end = datetime_start + timedelta(seconds=duration)
+    possible_measurements = []
+    possible_time = datetime.now(pytz.utc).replace(hour=0,minute=0,second=0,microsecond=0)
+    for t in range (0,96):
+        possible_measurements.append(possible_time)
+        possible_time = possible_time + timedelta(minutes=15)
+    measurement_times = []
+    for m in possible_measurements:
+        if m < datetime_start:
+            ecache_datetime_start = m
+        if datetime_start < m < datetime_end:
+            measurement_times.append(m)
+    if len(measurement_times) > 0:
+        ecache_datetime_start = measurement_times[0] - timedelta(minutes=15)
+    ecache_timestamp = datetime.timestamp(ecache_datetime_start)
+    measurement_times.append(datetime_end)
+    time_chunks = []
+    time_start = datetime_start
+    for m in measurement_times:
+        time_end = m
+        chunk = time_end - time_start
+        time_start = m
+        time_chunks.append(chunk.seconds)
     time.sleep(1.2) #energy meter bugging
     port.write(ENERGY_REQ)
     resp = port.read(1000)
-    energy_initial = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder) / 100.0
-    print(energy_initial)
-    time.sleep(duration)
-    port.write(ENERGY_REQ)
-    resp = port.read(1000)
-    energy_end = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder) / 100.0
-    print(energy_end)
+    energy_start = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder) / 100.0
+    session_energy_start = energy_start
+    local_ecache = []
+    for chunk in time_chunks:
+        time.sleep(chunk)
+        port.write(ENERGY_REQ)
+        resp = port.read(1000)
+        energy_end = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder) / 100.0
+        ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
+        ecache_energy_delta = energy_end - energy_start
+        local_ecache.append([ecache_timestamp, ecache_datetime_start, ecache_datetime_end, 'LOC', ecache_energy_delta])
+        print(energy_end)
+        ecache_datetime_start = datetime.now(pytz.utc)
+        ecache_timestamp = int(time.time())
     os.system('echo "0" > /sys/class/gpio/gpio15/value')
     os.system('echo "0" > /sys/class/gpio/gpio18/value')
     datetime_end = datetime.now(pytz.utc)
-    energy_delta = energy_end - energy_initial
-    local_data = []
-    local_data.append(timestamp)
-    local_data.append(datetime_start)
-    local_data.append(datetime_end)
-    local_data.append('LOC')
-    local_data.append(energy_delta)
-    return local_data
+    energy_delta = energy_end - session_energy_start
+    local_session = []
+    local_session.append(session_timestamp)
+    local_session.append(session_datetime_start)
+    local_session.append(datetime_end)
+    local_session.append('LOC')
+    local_session.append(energy_delta)
+    return [local_session, local_ecache]
+
+
+def loop(sessions):
+    while 1:
+        udp = udp_data()
+        tcp = tcp_data()
+        show_list(udp+tcp)
+        time.sleep(300)
 
 
 def energy_scenario():
-    sessions.append(energy_session(60))
-    time.sleep(30)
-    sessions.append(energy_session(300))
+    ecaches=[]
+    sessions = []
+    e = energy_session(60)
+    sessions.append(e[0])
+    ecaches = ecaches + e[1]
+    time.sleep(5)
     file_name = datetime.now().strftime("%Y-%m-%dZ%H:%M:%S")
-    with open(STORE_FILE_ALL, 'wb') as outfile:
-        pickle.dump(sessions, outfile)
-    with open(STORE_FOLDER + file_name + '.pickle', 'wb') as outfile:
-        pickle.dump(sessions, outfile)
-    with open(STORE_FOLDER + file_name + '.log', 'wb') as outfile:
-        pickle.dump(show_list(sessions), outfile)
+    with open(STORE_FOLDER + 'pickle_' + file_name + '.pickle', 'wb') as outfile:
+        pickle.dump(e, outfile)
+    export_csv(sessions, 'sessions_'+file_name)
+    export_csv(ecaches, 'ecaches_'+file_name)
 
 
 def udp_data():
@@ -162,10 +246,21 @@ def show_list(input_list):
     print(table_draw)
     return table_draw
 
+def export_csv(input_list, name):
+    with open(STORE_FOLDER + name + '.csv', 'w', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile, delimiter=',',
+                                quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        csvwriter.writerow(['Timestamp', 'Datetime start', 'Datetime end', 'Type', 'Energy'])
+        for line in input_list:
+            csvwriter.writerow(line)
 
 #sessions = init()
 #print(sessions)
 #energy_scenario()
 #udp = udp_data()
-tcp = tcp_data()
-show_list(tcp)
+#udp_e = udp_ecache('2019-02-18T11:45:19Z')
+#tcp = tcp_data()
+#tcp_e = tcp_ecache()
+#show_list(udp)
+#export_csv(tcp+udp)
+
