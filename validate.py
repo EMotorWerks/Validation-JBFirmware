@@ -9,6 +9,11 @@ import requests
 import pytz
 import serial
 
+import email, smtplib, ssl
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from datetime import datetime, timedelta
 from azure.cosmosdb.table.tableservice import TableService
@@ -33,8 +38,11 @@ DEVICE_ID = ''
 API_HISTORY_REQUEST = {'cmd':'get_history','device_id': DEVICE_ID,'token': TOKEN,'account_token': ACCOUNT_TOKEN}
 TCP_TABLE = ''
 UDP_TABLE = ''
-EMAIL = ''
+
 EMAIL_CC = ''
+EMAIL_TO = ''
+EMAIL_SENDER = ''
+EMAIL_PASS = ''
 
 #Data storage - list constsing of:
 #timestamp (seconds from epoch, also used for sorting by time)
@@ -42,6 +50,7 @@ EMAIL_CC = ''
 #datetime session stop
 #source name (UDP, TCP, LOCAL)  
 #energy in session
+
 
 
 def init():
@@ -124,6 +133,7 @@ def tcp_ecache():
 
 
 def udp_ecache(timestamp):
+    #timestamp format '2019-03-03T11:45:19Z'
     table_service = TableService(connection_string=CONNECTION_STRING)
     udp_requests = list(table_service.query_entities(UDP_TABLE, filter="Timestamp gt datetime'"+timestamp+"' and PartitionKey eq '"+DEVICE_ID+"'", select='Request'))
     udp_list = []
@@ -167,7 +177,7 @@ def energy_session(duration):
             measurement_times.append(m)
     if len(measurement_times) > 0:
         ecache_datetime_start = measurement_times[0] - timedelta(minutes=15)
-    ecache_timestamp = datetime.timestamp(ecache_datetime_start)
+    ecache_timestamp = int(datetime.timestamp(ecache_datetime_start))
     measurement_times.append(datetime_end)
     time_chunks = []
     time_start = datetime_start
@@ -176,10 +186,11 @@ def energy_session(duration):
         chunk = time_end - time_start
         time_start = m
         time_chunks.append(chunk.seconds)
-    time.sleep(1.2) #energy meter bugging
+    time.sleep(1.5) #energy meter bugging
     port.write(ENERGY_REQ)
     resp = port.read(1000)
     energy_start = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder)
+    print('START ENERGY ', energy_start)
     session_energy_start = energy_start
     local_ecache = []
     for chunk in time_chunks:
@@ -189,6 +200,7 @@ def energy_session(duration):
         energy_end = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder)
         ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
         ecache_energy_delta = energy_end - energy_start
+        print('ECACHE ENERGY ', ecache_energy_delta)
         local_ecache.append([ecache_timestamp, ecache_datetime_start, ecache_datetime_end, 'LOC', ecache_energy_delta])
         energy_start = energy_end
         ecache_datetime_start = datetime.now(pytz.utc)
@@ -197,6 +209,8 @@ def energy_session(duration):
     os.system('echo "0" > /sys/class/gpio/gpio18/value')
     datetime_end = datetime.now(pytz.utc)
     energy_delta = energy_end - session_energy_start
+    print('ENERGY SESSION END ', energy_end)
+    print('ENERGY SESSION ', energy_delta)
     local_session = []
     local_session.append(session_timestamp)
     local_session.append(session_datetime_start)
@@ -239,7 +253,7 @@ def compare_sessions(loc, ext):
         for ext_session in ext:
             if (ext_session[0] - 2) <= loc_session[0] <= (ext_session[0] + 2):
                 #found the session
-                energy_diff = loc_session[4] - ext_session[4]
+                energy_diff = int(loc_session[4]) - int(ext_session[4])
                 if energy_diff > allow_error or energy_diff < -allow_error:
                     ext_field = energy_diff
                 else:
@@ -247,6 +261,7 @@ def compare_sessions(loc, ext):
                     success += 1
                     break
         session.append(ext_field)
+        sessions.append(session)
     errors = len(sessions) - success
     return sessions, errors
 
@@ -260,30 +275,55 @@ def datetime_shift(data, hour_diff):
     return data
 
 
-def make_report_sessions(date):
+def make_report(date):
     loc = import_csv('sessions_' + date + '.csv')
-    udp = datetime_shift(udp_sessions(), 8) #current error
-    tcp = datetime_shift(tcp_sessions(), 24) #current error
-    tcp_report, tcp_errors = compare_sessions(loc, tcp)
-    udp_tcp_report, udp_errors = compare_sessions(tcp_report, udp)
-    errors = tcp_errors + udp_errors
-    print(report)
-    export_csv(report, 'session_report_' + date + '.csv')
+    udp = datetime_shift(udp_sessions(), 7)
+    tcp = datetime_shift(tcp_sessions(), 24)
+    session_tcp_report, session_tcp_errors = compare_sessions(loc, tcp)
+    session_udp_tcp_report, session_udp_errors = compare_sessions(session_tcp_report, udp)
+    errors = session_tcp_errors + session_udp_errors
+    loc = import_csv('ecaches_' + date + '.csv')
+    udp = datetime_shift(udp_ecache(date+'T00:00:00Z'), 7)
+    tcp = datetime_shift(tcp_ecache(), 24)
+    ecache_tcp_report, ecache_tcp_errors = compare_sessions(loc, tcp)
+    ecache_udp_tcp_report, ecache_udp_errors = compare_sessions(ecache_tcp_report, udp)
+    errors = session_tcp_errors + session_udp_errors + ecache_tcp_errors
+    header = [['Timestamp', 'Start', 'End', 'Tag', 'Energy','TCP STAT', 'UDP STAT']]
+    udp_tcp_session_report = header + [['SESSIONS']] + session_udp_tcp_report + [['ECACHES']] + ecache_udp_tcp_report
+    export_csv(udp_tcp_session_report, 'session_report_' + date + '.csv')
     send_email('session_report_' + date + '.csv', errors)
 
 
-def send_email(errors, report):
-    print(errors)
-    print(report)
+def send_email(filename, errors):
+    body = 'Sessions + Ecache report'
+    receivers = [EMAIL_TO, EMAIL_CC]
+    message = MIMEMultipart()
+    message['From'] = EMAIL_SENDER
+    message['To'] = EMAIL_TO
+    message['Subject'] = 'JB validate, errors: ' + str(errors)
+    message.attach(MIMEText(body, 'plain'))
+    with open(STORE_FOLDER + filename, 'rb') as attachment:
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(attachment.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", 'attachment', filename='report.csv')
+    message.attach(part)
+    text = message.as_string()
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as server:
+        server.login(EMAIL_SENDER, EMAIL_PASS)
+        server.sendmail(EMAIL_SENDER, receivers, text)
 
 
 def planned_scenario():
-    energy_session(100)
-    time.sleep(10)
-    energy_session(100) 
+    init()
+    energy_session(330)
+    time.sleep(60)
+    energy_session(330) 
 
 
 def random_scenario():
+    init()
     while 1:
         use_time = random.randint(1, 11000)  #from 1sec to 3h
         print('use_time ', use_time)
@@ -293,20 +333,6 @@ def random_scenario():
         time.sleep(idle_time)
 
 
-def send_email(name, errors):
-    msg = 'echo -e "To: '+EMAIL+'\nsubject: JB validation report, errors:'+str(errors)+'\nCC: '+EMAIL_CC+'\n\nReport"| (cat - && uuencode '+STORE_FOLDER+name+' '+name+') | ssmtp '+EMAIL
-    print(msg)
-    os.system(msg)
 
-
-
-#sessions = init()
-#print(sessions)
-#energy_scenario()
-#udp = udp_data()
-#udp_e = udp_ecache('2019-02-18T11:45:19Z')
-#tcp = tcp_data()
-#tcp_e = tcp_ecache()
-#show_list(udp)
-#export_csv(tcp+udp)
-#make_report_sessions('2019-03-07')
+random_scenario()
+#make_report('2019-03-13')
