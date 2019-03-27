@@ -19,16 +19,8 @@ from datetime import datetime, timedelta
 from azure.cosmosdb.table.tableservice import TableService
 
 
-SERIAL_PORT = '/dev/ttyUSB0'
-SERIAL_SPEED = 9600
-ENERGY_REQ = b'\xC0\x48\xFF\xFF\xFD\x00\x00\x00\x00\x00\xD2\x01\x30\x00\x01\x1C\xC0'
 STORE_FOLDER = ''
 
-
-STORE_FILE_ALL = STORE_FOLDER + 'all.pickle'
-
-
-#to be extracted from a config file - connection data deleted
 CONNECTION_STRING = ''
 UNIT_URL = ''
 DEV_API_SECURE_URL = ''
@@ -43,24 +35,6 @@ EMAIL_CC = ''
 EMAIL_TO = ''
 EMAIL_SENDER = ''
 EMAIL_PASS = ''
-
-#Data storage - list constsing of:
-#timestamp (seconds from epoch, also used for sorting by time)
-#datetime session start
-#datetime session stop
-#source name (UDP, TCP, LOCAL)  
-#energy in session
-
-
-
-def init():
-    #to be replaced by py module
-    os.system('echo "15" > /sys/class/gpio/export')
-    os.system('echo "18" > /sys/class/gpio/export')
-    time.sleep(0.2)
-    os.system('echo "out" > /sys/class/gpio/gpio15/direction')
-    os.system('echo "out" > /sys/class/gpio/gpio18/direction')
-    time.sleep(0.2)
 
 
 def tcp_sessions():
@@ -90,7 +64,7 @@ def tcp_sessions():
                     tcp_session.append(time_start)
                     tcp_session.append(time_end)
                     tcp_session.append('TCP')
-                    tcp_session.append(energy)
+                    tcp_session.append(int(energy))
                     tcp_sessions.append(tcp_session)
     return tcp_sessions
 
@@ -127,7 +101,7 @@ def tcp_ecache():
                 ecache_datetime_start = datetime.strptime(ecache_day_key, '%Y-%m-%dZ').replace(hour=i*15//60, minute=i*15%60, second=0)
                 ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
                 timestamp = datetime.timestamp(ecache_datetime_start)
-                ecache_list.append([timestamp, ecache_datetime_start, ecache_datetime_end, 'TCP', ecache_day[i]])
+                ecache_list.append([timestamp, ecache_datetime_start, ecache_datetime_end, 'TCP', int(ecache_day[i])])
     ecache_list.sort()
     return list(ecache_list for ecache_list, _ in itertools.groupby(ecache_list)) #removes duplicates
 
@@ -155,74 +129,6 @@ def udp_ecache(timestamp):
     return udp_list
 
 
-def energy_session(duration):
-    port = serial.Serial(SERIAL_PORT, SERIAL_SPEED)
-    port.timeout = 1
-    os.system('echo "1" > /sys/class/gpio/gpio15/value')
-    os.system('echo "1" > /sys/class/gpio/gpio18/value')
-    session_timestamp = int(time.time())
-    session_datetime_start = datetime.now(pytz.utc)
-    datetime_start = session_datetime_start
-    datetime_end = datetime_start + timedelta(seconds=duration)
-    possible_measurements = []
-    possible_time = datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    for _ in range(0, 192): #2 days
-        possible_measurements.append(possible_time)
-        possible_time = possible_time + timedelta(minutes=15)
-    measurement_times = []
-    for m in possible_measurements:
-        if m < datetime_start:
-            ecache_datetime_start = m
-        if datetime_start < m < datetime_end:
-            measurement_times.append(m)
-    if len(measurement_times) > 0:
-        ecache_datetime_start = measurement_times[0] - timedelta(minutes=15)
-    ecache_timestamp = int(datetime.timestamp(ecache_datetime_start))
-    measurement_times.append(datetime_end)
-    time_chunks = []
-    time_start = datetime_start
-    for m in measurement_times:
-        time_end = m
-        chunk = time_end - time_start
-        time_start = m
-        time_chunks.append(chunk.seconds)
-    time.sleep(1.5) #energy meter bugging
-    port.write(ENERGY_REQ)
-    resp = port.read(1000)
-    energy_start = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder)
-    print('START ENERGY ', energy_start)
-    session_energy_start = energy_start
-    local_ecache = []
-    for chunk in time_chunks:
-        time.sleep(chunk)
-        port.write(ENERGY_REQ)
-        resp = port.read(1000)
-        energy_end = int.from_bytes(resp[-6:-2], byteorder=sys.byteorder)
-        ecache_datetime_end = ecache_datetime_start + timedelta(minutes=15)
-        ecache_energy_delta = energy_end - energy_start
-        print('ECACHE ENERGY ', ecache_energy_delta)
-        local_ecache.append([ecache_timestamp, ecache_datetime_start, ecache_datetime_end, 'LOC', ecache_energy_delta])
-        energy_start = energy_end
-        ecache_datetime_start = datetime.now(pytz.utc)
-        ecache_timestamp = int(time.time())
-    os.system('echo "0" > /sys/class/gpio/gpio15/value')
-    os.system('echo "0" > /sys/class/gpio/gpio18/value')
-    datetime_end = datetime.now(pytz.utc)
-    energy_delta = energy_end - session_energy_start
-    print('ENERGY SESSION END ', energy_end)
-    print('ENERGY SESSION ', energy_delta)
-    local_session = []
-    local_session.append(session_timestamp)
-    local_session.append(session_datetime_start)
-    local_session.append(datetime_end)
-    local_session.append('LOC')
-    local_session.append(energy_delta)
-    date = datetime.now().strftime("%Y-%m-%d")
-    export_csv([local_session], 'sessions_' + date + '.csv')
-    export_csv(local_ecache, 'ecaches_' + date + '.csv')
-    return [[local_session], local_ecache]
-
-
 def export_csv(input_list, name):
     with open(STORE_FOLDER + name, 'a', newline='') as csvfile:
         csvwriter = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
@@ -235,7 +141,7 @@ def import_csv(name):
         csvreader = csv.reader(csvfile, delimiter=',', quotechar='|')
         out_list = []
         for row in csvreader:
-            row[0] = int(row[0])
+            row[0] = int(float(row[0]))
             row[1] = datetime.fromisoformat(row[1])
             row[2] = datetime.fromisoformat(row[2])
             row[4] = int(row[4])
@@ -246,20 +152,15 @@ def import_csv(name):
 def compare_sessions(loc, ext):
     sessions = []
     success = 0
-    allow_error = 10
+    time_error = 10
     for loc_session in loc:
         session = [e for e in loc_session]
         ext_field = 'NF'
         for ext_session in ext:
-            if (ext_session[0] - 2) <= loc_session[0] <= (ext_session[0] + 2):
+            if (ext_session[0] - time_error) <= loc_session[0] <= (ext_session[0] + time_error):
                 #found the session
-                energy_diff = int(loc_session[4]) - int(ext_session[4])
-                if energy_diff > allow_error or energy_diff < -allow_error:
-                    ext_field = energy_diff
-                else:
-                    ext_field = 'OK'
-                    success += 1
-                    break
+                ext_field = ext_session[4]
+                success = success + 1
         session.append(ext_field)
         sessions.append(session)
     errors = len(sessions) - success
@@ -276,31 +177,59 @@ def datetime_shift(data, hour_diff):
 
 
 def make_report(date):
-    loc = import_csv('sessions_' + date + '.csv')
+    loc = []
+    try:
+        loc = import_csv('sessions_' + date + '.csv')
+    except Exception as e:
+        pass
     udp = datetime_shift(udp_sessions(), 7)
-    tcp = datetime_shift(tcp_sessions(), 24)
+    tcp = datetime_shift(tcp_sessions(), 0)
     session_tcp_report, session_tcp_errors = compare_sessions(loc, tcp)
     session_udp_tcp_report, session_udp_errors = compare_sessions(session_tcp_report, udp)
-    errors = session_tcp_errors + session_udp_errors
-    loc = import_csv('ecaches_' + date + '.csv')
+    loc = []
+    try:
+        loc = import_csv('ecaches_' + date + '.csv')
+    except Exception as e:
+        pass
+    timestamp = 0
+    for i in range(0, len(loc)):
+        if loc[i][0] - timestamp < 10:
+            loc[i][4] = loc[i][4]+loc[i-1][4]
+            loc[i-1][1] = 'del'
+        timestamp = loc[i][0]
+    loc_merged = []
+    for i in range(0, len(loc)):
+        if loc[i][1] != 'del':
+            loc_merged.append(loc[i])
     udp = datetime_shift(udp_ecache(date+'T00:00:00Z'), 7)
-    tcp = datetime_shift(tcp_ecache(), 24)
-    ecache_tcp_report, ecache_tcp_errors = compare_sessions(loc, tcp)
+    tcp = datetime_shift(tcp_ecache(), 0)
+    ecache_tcp_report, ecache_tcp_errors = compare_sessions(loc_merged, tcp)
     ecache_udp_tcp_report, ecache_udp_errors = compare_sessions(ecache_tcp_report, udp)
-    errors = session_tcp_errors + session_udp_errors + ecache_tcp_errors
-    header = [['Timestamp', 'Start', 'End', 'Tag', 'Energy','TCP STAT', 'UDP STAT']]
+    errors = session_tcp_errors + session_udp_errors + ecache_tcp_errors + ecache_udp_errors
+    header = [['Date', 'Start time', 'End time', 'Duration', 'Local Wh','TCP Wh', 'UDP Wh']]
+    for line in session_udp_tcp_report:
+        line[0] = line[1].strftime("%Y-%m-%d")
+        line[3] = str(line[2] - line[1])
+        line[1] = line[1].strftime("%H:%M:%S")
+        line[2] = line[2].strftime("%H:%M:%S")
+    for line in ecache_udp_tcp_report:
+        line[0] = line[1].strftime("%Y-%m-%d")
+        line[3] = str(line[2] - line[1])
+        line[1] = line[1].strftime("%H:%M:%S")
+        line[2] = line[2].strftime("%H:%M:%S")
     udp_tcp_session_report = header + [['SESSIONS']] + session_udp_tcp_report + [['ECACHES']] + ecache_udp_tcp_report
-    export_csv(udp_tcp_session_report, 'session_report_' + date + '.csv')
-    send_email('session_report_' + date + '.csv', errors)
+    export_csv(udp_tcp_session_report, 'report_' + date + '.csv')
+    print(errors)
+    send_email('report_' + date + '.csv', date)
 
 
-def send_email(filename, errors):
+def send_email(filename, date):
     body = 'Sessions + Ecache report'
     receivers = [EMAIL_TO, EMAIL_CC]
     message = MIMEMultipart()
     message['From'] = EMAIL_SENDER
     message['To'] = EMAIL_TO
-    message['Subject'] = 'JB validate, errors: ' + str(errors)
+    message['Subject'] = 'JB validate ' + date
     message.attach(MIMEText(body, 'plain'))
     with open(STORE_FOLDER + filename, 'rb') as attachment:
         part = MIMEBase('application', 'octet-stream')
@@ -315,24 +244,7 @@ def send_email(filename, errors):
         server.sendmail(EMAIL_SENDER, receivers, text)
 
 
-def planned_scenario():
-    init()
-    energy_session(330)
-    time.sleep(60)
-    energy_session(330) 
+date = (datetime.now() - timedelta(days=4)).strftime("%Y-%m-%d")
+#make_report('2019-03-19')
+#make_report(date)
 
-
-def random_scenario():
-    init()
-    while 1:
-        use_time = random.randint(1, 11000)  #from 1sec to 3h
-        print('use_time ', use_time)
-        energy_session(use_time)
-        idle_time = random.randint(1, 11000)
-        print('idle_time', idle_time)
-        time.sleep(idle_time)
-
-
-
-random_scenario()
-#make_report('2019-03-13')
